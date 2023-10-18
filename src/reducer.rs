@@ -1,15 +1,19 @@
 use crate::models::{AnyOpenAIClient, MotorheadError};
 use std::error::Error;
 use tiktoken_rs::p50k_base;
+use itertools::Itertools;
 
 pub async fn incremental_summarization(
     model: String,
     openai_client: &AnyOpenAIClient,
     context: Option<String>,
-    mut messages: Vec<String>,
+    mut messages: Vec<(String, String)>,
 ) -> Result<(String, u32), Box<dyn Error + Send + Sync>> {
     messages.reverse();
-    let messages_joined = messages.join("\n");
+    let messages_joined = messages
+    .iter()
+    .map(|(_, message)| message.as_str())  // Convert &String to &str
+    .join("\n");
     let prev_summary = context.as_deref().unwrap_or_default();
     // Taken from langchain
     let progresive_prompt = format!(
@@ -62,7 +66,7 @@ pub async fn handle_compaction(
     let half = window_size / 2;
     let session_key = format!("session:{}", &*session_id);
     let context_key = format!("context:{}", &*session_id);
-    let (messages, mut context): (Vec<String>, Option<String>) = redis::pipe()
+    let (messages, mut context): (Vec<(String, String)>, Option<String>) = redis::pipe()
         .cmd("LRANGE")
         .arg(session_key.clone())
         .arg(half)
@@ -81,13 +85,13 @@ pub async fn handle_compaction(
     let mut temp_messages = Vec::new();
     let mut total_tokens_temp = 0;
 
-    for message in messages {
+    for (message_id, message) in messages {
         let bpe = p50k_base().unwrap();
         let message_tokens = bpe.encode_with_special_tokens(&message);
         let message_tokens_used = message_tokens.len();
 
         if total_tokens_temp + message_tokens_used <= max_message_tokens {
-            temp_messages.push(message);
+            temp_messages.push((message_id, message));
             total_tokens_temp += message_tokens_used;
         } else {
             let (summary, summary_tokens_used) = incremental_summarization(
@@ -101,7 +105,7 @@ pub async fn handle_compaction(
             total_tokens += summary_tokens_used;
 
             context = Some(summary);
-            temp_messages = vec![message];
+            temp_messages = vec![(message_id, message)];
             total_tokens_temp = message_tokens_used;
         }
     }

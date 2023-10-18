@@ -144,9 +144,10 @@ pub struct SearchPayload {
 pub struct MemoryMessage {
     pub role: String,
     pub content: String,
+    pub message_id: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct MemoryMessagesAndContext {
     pub messages: Vec<MemoryMessage>,
     pub context: Option<String>,

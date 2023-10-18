@@ -8,7 +8,7 @@ mod retrieval;
 
 use actix_web::{error, middleware, web, App, HttpResponse, HttpServer};
 use healthcheck::get_health;
-use memory::{delete_memory, get_memory, get_sessions, post_memory};
+use memory::{delete_memory, get_memory, get_sessions, post_memory, delete_message, update_message};
 use models::{AppState, OpenAIClientManager};
 use redis_utils::ensure_redisearch_index;
 use retrieval::run_retrieval;
@@ -89,6 +89,8 @@ async fn main() -> io::Result<()> {
             .service(post_memory)
             .service(delete_memory)
             .service(get_sessions)
+            .service(update_message)
+            .service(delete_message)          
             .service(run_retrieval)
             .app_data(web::JsonConfig::default().error_handler(|err, _req| {
                 error::InternalError::from_response(
