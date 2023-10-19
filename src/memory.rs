@@ -1,10 +1,11 @@
 use crate::long_term_memory::index_messages;
+use uuid::Uuid;
 use crate::models::{
     AckResponse, AppState, GetSessionsQuery, MemoryMessage, MemoryMessagesAndContext,
     MemoryResponse, NamespaceQuery,
 };
 use crate::reducer::handle_compaction;
-use actix_web::{delete, error, get, post, web, HttpResponse, Responder};
+use actix_web::{patch, delete, error, get, post, web, HttpResponse, Responder};
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -88,18 +89,19 @@ pub async fn get_memory(
         .unwrap_or(0);
 
     let messages: Vec<MemoryMessage> = messages
-        .into_iter()
-        .filter_map(|message| {
-            let mut parts = message.splitn(2, ": ");
-            match (parts.next(), parts.next()) {
-                (Some(role), Some(content)) => Some(MemoryMessage {
-                    role: role.to_string(),
-                    content: content.to_string(),
-                }),
-                _ => None,
-            }
-        })
-        .collect();
+            .into_iter()
+            .filter_map(|message| {
+                let mut parts = message.splitn(2, ": ");
+                match (parts.next(), parts.next()) {
+                    (Some(role), Some(content)) => Some(MemoryMessage {
+                        role: role.to_string(),
+                        content: content.to_string(),
+                        message_id: Some(Uuid::new_v4().to_string()),
+                    }),
+                    _ => None,
+                }
+            })
+            .collect();
 
     let response = MemoryResponse {
         messages,
@@ -115,7 +117,7 @@ pub async fn get_memory(
 #[post("/sessions/{session_id}/memory")]
 pub async fn post_memory(
     session_id: web::Path<String>,
-    web::Json(memory_messages): web::Json<MemoryMessagesAndContext>,
+    web::Json(input): web::Json<MemoryMessagesAndContext>,
     data: web::Data<Arc<AppState>>,
     redis: web::Data<redis::Client>,
     web::Query(namespace_query): web::Query<NamespaceQuery>,
@@ -125,18 +127,21 @@ pub async fn post_memory(
         .await
         .map_err(error::ErrorInternalServerError)?;
 
-    let memory_messages_clone: Vec<MemoryMessage> = memory_messages.messages.to_vec();
-
-    let messages: Vec<String> = memory_messages
-        .messages
+    // Generate a UUID for each message
+    let messages: Vec<MemoryMessage> = input.messages
         .into_iter()
-        .map(|memory_message| format!("{}: {}", memory_message.role, memory_message.content))
+        .map(|mut message| {
+            message.message_id = Some(Uuid::new_v4().to_string());
+            message
+        })
         .collect();
 
     // If new context is passed in we overwrite the existing one
-    if let Some(context) = memory_messages.context {
-        redis::Cmd::set(format!("context:{}", &*session_id), context)
-            .query_async::<_, ()>(&mut conn)
+    if let Some(context) = &input.context {
+        redis::cmd("SET")
+            .arg(format!("context:{}", &*session_id))
+            .arg(context)
+            .query_async(&mut conn)
             .await
             .map_err(error::ErrorInternalServerError)?;
     }
@@ -155,8 +160,17 @@ pub async fn post_memory(
         .await
         .map_err(error::ErrorInternalServerError)?;
 
-    let res: i64 = redis::Cmd::lpush(format!("session:{}", &*session_id), messages.clone())
-        .query_async::<_, i64>(&mut conn)
+    // Convert MemoryMessage to strings for Redis
+    let messages_str: Vec<String> = messages
+        .clone()
+        .into_iter()
+        .map(|message| format!("{}: {}", message.role, message.content))
+        .collect();
+
+    let res: i64 = redis::cmd("RPUSH")
+        .arg(format!("session:{}", &*session_id))
+        .arg(messages_str)
+        .query_async(&mut conn)
         .await
         .map_err(error::ErrorInternalServerError)?;
 
@@ -168,8 +182,7 @@ pub async fn post_memory(
         tokio::spawn(async move {
             let client_wrapper = pool.get().await.unwrap();
             let client = client_wrapper.deref();
-            if let Err(e) = index_messages(memory_messages_clone, session, client, conn_clone).await
-            {
+            if let Err(e) = index_messages(messages.clone(), session, client, conn_clone).await {
                 log::error!("Error in index_messages: {:?}", e);
             }
         });
@@ -208,6 +221,7 @@ pub async fn post_memory(
         .json(response))
 }
 
+
 #[delete("/sessions/{session_id}/memory")]
 pub async fn delete_memory(
     session_id: web::Path<String>,
@@ -240,6 +254,103 @@ pub async fn delete_memory(
         .query_async(&mut conn)
         .await
         .map_err(error::ErrorInternalServerError)?;
+
+    let response = AckResponse { status: "Ok" };
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response))
+}
+
+
+#[patch("/sessions/{session_id}/message/{message_id}")]
+pub async fn update_message(
+    session_id: web::Path<String>,
+    message_id: web::Path<String>,
+    web::Json(updated_message): web::Json<MemoryMessage>,
+    redis: web::Data<redis::Client>,
+    web::Query(namespace_query): web::Query<NamespaceQuery>,
+) -> actix_web::Result<impl Responder> {
+    let mut conn = redis  
+        .get_tokio_connection_manager()  
+        .await  
+        .map_err(error::ErrorInternalServerError)?;  
+
+    let session_key = match &namespace_query.namespace {
+        Some(namespace) => format!("{}:session:{}", namespace, &*session_id),
+        None => format!("session:{}", &*session_id),
+    };
+  
+    let existing_messages: Vec<String> = redis::cmd("LRANGE")  
+        .arg(&session_key)  
+        .arg(0)  
+        .arg(-1)  
+        .query_async(&mut conn)  
+        .await  
+        .map_err(error::ErrorInternalServerError)?;  
+
+    let message_index = existing_messages.iter()
+        .position(|message| message.ends_with(&format!(": {}", &*message_id)));  
+
+    if let Some(index) = message_index {  
+        let new_message_format = format!("{}: {}: {}", updated_message.role, updated_message.content, updated_message.message_id.unwrap_or_default());
+        let _: () = redis::cmd("LSET")  
+            .arg(&session_key)  
+            .arg(index)  
+            .arg(&new_message_format)  
+            .query_async(&mut conn)  
+            .await  
+            .map_err(error::ErrorInternalServerError)?;  
+    } else {  
+        return Err(error::ErrorBadRequest("Message not found"));  
+    }  
+
+    let response = AckResponse { status: "Ok" };  
+    Ok(HttpResponse::Ok()  
+        .content_type("application/json")  
+        .json(response))  
+}  
+
+
+
+#[delete("/sessions/{session_id}/memory/message/{message_id}")]
+pub async fn delete_message(
+    session_id: web::Path<String>,
+    message_id: web::Path<String>,
+    redis: web::Data<redis::Client>,
+    web::Query(namespace_query): web::Query<NamespaceQuery>,
+) -> actix_web::Result<impl Responder> {
+    let mut conn = redis
+        .get_tokio_connection_manager()
+        .await
+        .map_err(error::ErrorInternalServerError)?;
+
+    // Use namespace_query to form the session_key
+    let session_key = match &namespace_query.namespace {
+        Some(namespace) => format!("{}:session:{}", namespace, &*session_id),
+        None => format!("session:{}", &*session_id),
+    };
+
+    // Fetch all messages in the session
+    let session_messages: Vec<String> = redis::cmd("LRANGE")
+        .arg(&session_key)
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut conn)
+        .await
+        .map_err(error::ErrorInternalServerError)?;
+
+    // Find the message matching the message_id and remove it
+    if let Some(message_string) = session_messages.into_iter().find(|message| message.ends_with(&*message_id)) {
+        redis::cmd("LREM")
+        .arg(&session_key)
+        .arg(0)
+        .arg(&message_string)
+        .query_async(&mut conn)
+        .await
+        .map_err(error::ErrorInternalServerError)?;
+    } else {
+        return Err(error::ErrorBadRequest("Message not found"));
+    }
 
     let response = AckResponse { status: "Ok" };
     Ok(HttpResponse::Ok()
